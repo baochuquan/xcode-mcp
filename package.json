@@ -1,6 +1,6 @@
 {
   "name": "@baochuquan/xcode-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for Xcode integration, installable via npx",
   "type": "module",
   "bin": {
@@ -16,9 +16,10 @@
     "prebuild": "npm run clean",
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build",
+    "prepublishOnly": "npm run build && npm test && npm run smoke",
     "start": "node dist/index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "smoke": "node scripts/smoke-test.mjs"
   },
   "keywords": [
     "xcode",
@@ -43,11 +44,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.9.0",
     "glob": "^11.0.1",
+    "xcode": "^3.0.1",
     "zod": "3.24.2"
   },
   "devDependencies": {
     "@types/glob": "^8.1.0",
     "@types/node": "^20.17.28",
+    "@types/xcode": "^3.0.0",
     "esbuild": "^0.28.0",
     "typescript": "^5.8.2"
   }

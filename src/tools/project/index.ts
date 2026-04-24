@@ -8,6 +8,7 @@ import { XcodeServer } from "../../server.js";
 import { getProjectInfo } from "../../utils/project.js";
 import { ProjectNotFoundError, PathAccessError, FileOperationError, CommandExecutionError } from "../../utils/errors.js";
 import { runExecFile } from "../../utils/execFile.js";
+import { addFileToPbxproj } from "../../utils/pbxprojEditor.js";
 
 /**
  * Interface for workspace document
@@ -803,14 +804,25 @@ export function registerProjectTools(server: XcodeServer) {
   );
 
   // Register "add_file_to_project"
+  //
+  // Implementation note: previously this tool generated AppleScript to drive the
+  // Xcode app, but Xcode 14+ removed the `add` verb from its scripting
+  // dictionary (`Xcode.sdef`). Any script using `add file …` / `add files …`
+  // raises -2741 ("expected end of line, but found class name") because the
+  // parser treats `file` / `files` as reserved class names. We now edit
+  // project.pbxproj directly via the `xcode` npm package, which works:
+  //   - across Xcode 14 / 15 / 16
+  //   - whether or not Xcode is running
+  //   - without requiring AppleScript permission grants
+  // See src/utils/pbxprojEditor.ts for the implementation.
   server.server.tool(
     "add_file_to_project",
-    "Adds a file to the active Xcode project.",
+    "Adds a file to the active Xcode project by editing project.pbxproj directly (no AppleScript, no Xcode app required).",
     {
       filePath: z.string().describe("Path to the file to add to the project"),
-      targetName: z.string().optional().describe("Name of the target to add the file to. If not provided, will try to add to the first target."),
-      group: z.string().optional().describe("Group path within the project to add the file to (e.g., 'MyApp/Models'). If not provided, will add to the root group."),
-      createGroups: z.boolean().optional().describe("Whether to create intermediate groups if they don't exist (default: true)")
+      targetName: z.string().optional().describe("Name of the target to add the file to. If not provided, the project's first native target is used."),
+      group: z.string().optional().describe("Slash-separated Xcode group path (e.g. 'MyApp/Models'). If not provided, the file is added directly under the project's main group."),
+      createGroups: z.boolean().optional().describe("Whether to create intermediate Xcode groups along `group` if they don't exist (default: true).")
     },
     async ({ filePath, targetName, group, createGroups = true }) => {
       try {
@@ -818,180 +830,53 @@ export function registerProjectTools(server: XcodeServer) {
           throw new ProjectNotFoundError();
         }
 
-        // Validate and resolve the file path
         const expandedFilePath = server.pathManager.expandPath(filePath);
         const resolvedFilePath = server.directoryState.resolvePath(expandedFilePath);
         server.pathManager.validatePathForReading(resolvedFilePath);
 
-        // Check if the file exists
         try {
           const stats = await fs.stat(resolvedFilePath);
           if (!stats.isFile()) {
             throw new Error(`Path is not a file: ${filePath}`);
           }
-        } catch (error) {
+        } catch {
           throw new Error(`File not found: ${filePath}`);
         }
 
-        // Check if the active project is a workspace or a standard project
         if (server.activeProject.isWorkspace) {
-          throw new Error("Adding files directly to a workspace is not supported. Please set a specific project as active.");
+          throw new Error("Adding files directly to a workspace is not supported. Please set a specific .xcodeproj as active first.");
         }
 
-        // Check if the active project is an SPM project
         if (server.activeProject.isSPMProject) {
-          throw new Error("Adding files directly to a Swift Package Manager project is not supported. Please modify the Package.swift file instead.");
+          throw new Error("Adding files to a Swift Package Manager project is not supported. Edit Package.swift instead.");
         }
 
-        // Get the project directory
-        const projectDir = path.dirname(server.activeProject.path);
+        const result = await addFileToPbxproj({
+          projectPath: server.activeProject.path,
+          filePath: resolvedFilePath,
+          targetName,
+          groupPath: group,
+          createGroups,
+        });
 
-        // Make the file path relative to the project directory if it's not already
-        const relativeFilePath = path.isAbsolute(resolvedFilePath) && resolvedFilePath.startsWith(projectDir)
-          ? path.relative(projectDir, resolvedFilePath)
-          : resolvedFilePath;
-
-        // Build the command to add the file to the project
-        let cmd = `cd "${projectDir}" && xcrun swift package generate-xcodeproj`;
-
-        // For standard Xcode projects, we need to use a different approach
-        // Since there's no direct CLI for adding files to Xcode projects, we'll use a script
-
-        // Create a temporary AppleScript file to add the file to the project
-        const tempScriptPath = path.join(projectDir, "temp_add_file.scpt");
-
-        // Build the AppleScript content
-        let scriptContent = `
-          tell application "Xcode"
-            open "${server.activeProject.path}"
-            set mainWindow to window 1
-
-            -- Wait for the project to load
-            delay 1
-
-            -- Get the project document
-            set projectDocument to document 1
-
-            -- Add the file to the project
-            tell projectDocument
-              -- Add the file
-              set theFile to POSIX file "${resolvedFilePath}"
-        `;
-
-        // Add target specification if provided
-        if (targetName) {
-          scriptContent += `
-              -- Add to specific target
-              set targetList to targets of projectDocument
-              set foundTarget to false
-
-              repeat with aTarget in targetList
-                if name of aTarget is "${targetName}" then
-                  add files theFile to aTarget
-                  set foundTarget to true
-                  exit repeat
-                end if
-              end repeat
-
-              if not foundTarget then
-                error "Target '${targetName}' not found in project"
-              end if
-          `;
-        } else {
-          scriptContent += `
-              -- Add to first target
-              set targetList to targets of projectDocument
-              if (count of targetList) > 0 then
-                add files theFile to item 1 of targetList
-              end if
-          `;
+        const lines: string[] = [];
+        lines.push(
+          result.alreadyExists
+            ? "File is already referenced in the project (no changes written):"
+            : "Successfully added file to project:",
+        );
+        lines.push(`  file:        ${result.pbxprojRelativePath}`);
+        lines.push(`  kind:        ${result.fileKind}`);
+        lines.push(`  target:      ${result.targetName}`);
+        lines.push(`  group:       ${result.groupPath || "<root>"}`);
+        if (result.buildPhase) {
+          lines.push(`  buildPhase:  ${result.buildPhase}`);
         }
+        lines.push(`  pbxproj:     ${result.pbxprojPath}`);
 
-        // Add group specification if provided
-        if (group) {
-          scriptContent += `
-              -- Add to specific group
-              set groupPath to "${group}"
-              set groupComponents to my splitString(groupPath, "/")
-              set currentGroup to main group of projectDocument
-
-              repeat with groupName in groupComponents
-                set foundGroup to false
-                set childGroups to groups of currentGroup
-
-                repeat with childGroup in childGroups
-                  if name of childGroup is groupName then
-                    set currentGroup to childGroup
-                    set foundGroup to true
-                    exit repeat
-                  end if
-                end repeat
-
-                if not foundGroup then
-                  if ${createGroups} then
-                    -- Create the group if it doesn't exist
-                    set currentGroup to make new group with properties {name:groupName} at end of groups of currentGroup
-                  else
-                    error "Group '" & groupName & "' not found in path '" & groupPath & "'"
-                  end if
-                end if
-              end repeat
-
-              -- Move the file to the target group
-              move item 1 of files of main group of projectDocument to end of files of currentGroup
-          `;
-        }
-
-        // Close the script
-        scriptContent += `
-              -- Save the project
-              save projectDocument
-            end tell
-          end tell
-
-          -- Helper function to split a string
-          on splitString(theString, theDelimiter)
-            set oldDelimiters to AppleScript's text item delimiters
-            set AppleScript's text item delimiters to theDelimiter
-            set theArray to every text item of theString
-            set AppleScript's text item delimiters to oldDelimiters
-            return theArray
-          end splitString
-        `;
-
-        // Write the script to a temporary file
-        await fs.writeFile(tempScriptPath, scriptContent, "utf-8");
-
-        try {
-          const { stdout, stderr } = await runExecFile("osascript", [tempScriptPath]);
-
-          // Clean up the temporary script file
-          await fs.unlink(tempScriptPath).catch(() => {});
-
-          return {
-            content: [{
-              type: "text",
-              text: `Successfully added file to project:\n` +
-                    `File: ${resolvedFilePath}\n` +
-                    `Project: ${server.activeProject.path}\n` +
-                    (targetName ? `Target: ${targetName}\n` : "") +
-                    (group ? `Group: ${group}\n` : "") +
-                    `\n${stdout}${stderr ? '\nError output:\n' + stderr : ''}`
-            }]
-          };
-        } catch (error) {
-          // Clean up the temporary script file
-          await fs.unlink(tempScriptPath).catch(() => {});
-
-          let stderr = '';
-          if (error instanceof Error && 'stderr' in error) {
-            stderr = (error as any).stderr;
-          }
-
-          throw new Error(
-            `Failed to add file to project: ${stderr || (error instanceof Error ? error.message : String(error))}`
-          );
-        }
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+        };
       } catch (error) {
         if (error instanceof ProjectNotFoundError) {
           throw new Error("No active project set. Use set_project_path to set an active project first.");
